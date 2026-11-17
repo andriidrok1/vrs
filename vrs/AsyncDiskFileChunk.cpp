@@ -37,6 +37,31 @@ struct IoEngineTypeConverter : public vrs::EnumStringConverter<
                                    vrs::AsyncDiskFileChunk::IoEngine::AIO,
                                    vrs::AsyncDiskFileChunk::IoEngine::AIO,
                                    true> {};
+
+#if POSIX_AIO_SUPPORTED()
+#if IS_LINUX_PLATFORM()
+// The 64-bit variants of the AIO calls, matching vrs::AioControlBlock.
+int aioWrite(vrs::AioControlBlock* cb) {
+  return ::aio_write64(cb);
+}
+int aioError(const vrs::AioControlBlock* cb) {
+  return ::aio_error64(cb);
+}
+ssize_t aioReturn(vrs::AioControlBlock* cb) {
+  return ::aio_return64(cb);
+}
+#else
+int aioWrite(vrs::AioControlBlock* cb) {
+  return ::aio_write(cb);
+}
+int aioError(const vrs::AioControlBlock* cb) {
+  return ::aio_error(cb);
+}
+ssize_t aioReturn(vrs::AioControlBlock* cb) {
+  return ::aio_return(cb);
+}
+#endif
+#endif
 } // namespace
 
 namespace vrs {
@@ -282,7 +307,12 @@ int AsyncFileDescriptor::open(const string& path, const char* modes, int flags) 
     XR_LOGCE(VRS_DISKFILECHUNK, "Unsupported open mode: '%s'", modes);
     return INVALID_PARAMETER;
   }
+#if (defined(__ANDROID_API__) && __ANDROID_API__ < 21)
   int newFd = ::open(path.c_str(), flags, permissions);
+#else
+  // open64 sets O_LARGEFILE, without which a 32-bit process gets EFBIG past 2 GiB
+  int newFd = ::open64(path.c_str(), flags, permissions);
+#endif
   if (newFd < 0) {
     return errno;
   }
@@ -298,8 +328,8 @@ bool AsyncFileDescriptor::isOpened() const {
   return fd_ >= 0;
 }
 
-int AsyncFileDescriptor::read(void* ptr, size_t bufferSize, size_t offset, size_t& outReadSize) {
-  ssize_t ret = ::pread(fd_, ptr, bufferSize, offset);
+int AsyncFileDescriptor::read(void* ptr, size_t bufferSize, int64_t offset, size_t& outReadSize) {
+  ssize_t ret = ::pread64(fd_, ptr, bufferSize, static_cast<off64_t>(offset));
   if (ret < 0) {
     outReadSize = 0;
     return errno;
@@ -313,12 +343,10 @@ int AsyncFileDescriptor::read(void* ptr, size_t bufferSize, size_t offset, size_
 }
 
 int AsyncFileDescriptor::truncate(int64_t newSize) {
-#if IS_WINDOWS_PLATFORM()
-  return ::_chsize_s(fd_, newSize);
-#elif (defined(__ANDROID_API__) && __ANDROID_API__ >= 21)
-  return ::ftruncate64(fd_, static_cast<off64_t>(newSize));
-#else
+#if (defined(__ANDROID_API__) && __ANDROID_API__ < 21)
   return ::ftruncate(fd_, newSize);
+#else
+  return ::ftruncate64(fd_, static_cast<off64_t>(newSize));
 #endif
 }
 
@@ -333,8 +361,8 @@ int AsyncFileDescriptor::seek(int64_t pos, int origin, int64_t& outFilepos) {
   }
 }
 
-int AsyncFileDescriptor::pwrite(const void* buf, size_t count, off_t offset, size_t& written) {
-  ssize_t result = ::pwrite(fd_, buf, count, offset);
+int AsyncFileDescriptor::pwrite(const void* buf, size_t count, int64_t offset, size_t& written) {
+  ssize_t result = ::pwrite64(fd_, buf, count, static_cast<off64_t>(offset));
   written = result;
   if (result != count) {
     if (result < 0) {
@@ -460,7 +488,7 @@ int AsyncBuffer::start_write(
   aiocb_.aio_lio_opcode = 0; // used for lio_lioio only, unused
   on_complete_ = std::move(on_complete);
 
-  if (aio_write(&aiocb_) != 0) {
+  if (aioWrite(&aiocb_) != 0) {
     io_return = -1;
     io_errno = errno;
     if (io_errno == 0) {
@@ -475,7 +503,8 @@ int AsyncBuffer::start_write(
 #else
   // no POSIX AIO, use synchronous pwrite as fallback
   on_complete_ = std::move(on_complete);
-  ssize_t written = ::pwrite(file.fd_, AlignedBuffer::data(), size(), offset);
+  ssize_t written =
+      ::pwrite64(file.fd_, AlignedBuffer::data(), size(), static_cast<off64_t>(offset));
   if (written < 0) {
     io_return = -1;
     io_errno = errno;
@@ -526,20 +555,20 @@ void AsyncBuffer::SigEvNotifyFunction(union sigval val) {
   int io_errno = 0;
 
   // Runs on a libc SIGEV_THREAD thread.
-  io_errno = aio_error(&self->aiocb_);
+  io_errno = aioError(&self->aiocb_);
   if (io_errno == 0) {
-    io_return = aio_return(&self->aiocb_);
+    io_return = aioReturn(&self->aiocb_);
     XR_CHECK_GE(
         io_return, 0, "aio_return returned {} despite aio_error indicating success", io_return);
   } else if (io_errno == EINPROGRESS) {
     XR_CHECK(false, "aio_error()==EINPROGRESS on a completed aio_write");
   } else if (io_errno == ECANCELED) {
     // If canceled, aio_return will give -1
-    io_return = aio_return(&self->aiocb_);
+    io_return = aioReturn(&self->aiocb_);
     XR_CHECK_LT(
         io_return, 0, "aio_error() signaled cancellation, but aio_return returned {}", io_return);
   } else if (io_errno > 0) {
-    io_return = aio_return(&self->aiocb_);
+    io_return = aioReturn(&self->aiocb_);
     XR_CHECK_LT(
         io_return,
         0,
